@@ -38,7 +38,7 @@ db = firestore.client()
 
 @app.route('/signup', methods=['POST'])
 def signup():
-    data = request.json
+    data = request.jso
     email = data['email']
     password = data['password']
     name = data.get('name', '')

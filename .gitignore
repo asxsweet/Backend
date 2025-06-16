@@ -1,1 +1,24 @@
-"post.json" 
+# .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+
+# Firebase Admin SDK credentials (VERY IMPORTANT!)
+post.json
+
+# Temporary uploaded files
+temp_uploads/
+
+# Flask debug files
+*.sqlite3
+instance/
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Other
+venv/

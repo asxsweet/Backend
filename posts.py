@@ -1,150 +1,62 @@
-from flask import Flask, request, jsonify
-from firebase_admin import storage
-from firebase_admin import credentials, firestore, storage
-import firebase_admin
-import pyrebase
-import firebase_admin
-from firebase_admin import credentials, firestore
-from functools import wraps
-from firebase_admin import auth as admin_auth
+from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 import uuid
 import os
 from datetime import datetime
+from urllib.parse import urlparse, unquote
 
-app = Flask(__name__)
+# Import initialized Firebase instances and utility functions
+from firebase_utils import db, bucket, UPLOAD_FOLDER
+from auth import token_required  # Import the decorator
 
-# Firebase Pyrebase config
-firebaseConfig = {
-    "apiKey": "AIzaSyDQ1HiMl7-5pB5KB_tQjaSCz1Z4iW2LCB8",
-    "authDomain": "post-147cb.firebaseapp.com",
-    "projectId": "post-147cb",
-    "storageBucket": "post-147cb.firebasestorage.app",
-    "messagingSenderId": "89814444873",
-    "appId": "1:89814444873:web:3a0528574a03e4fc470898",
-    "measurementId": "G-HYQVXGL65P",
-    "databaseURL": ""
-}
-
-firebase = pyrebase.initialize_app(firebaseConfig)
-auth = firebase.auth()
-
-# Firebase Admin SDK
-cred = credentials.Certificate("post.json")
-firebase_admin.initialize_app(cred, {
-    'storageBucket': 'post-147cb.firebasestorage.app'
-})
-db = firestore.client()
-
-@app.route('/signup', methods=['POST'])
-def signup():
-    data = request.json
-    email = data['email']
-    password = data['password']
-    name = data.get('name', '')
-
-    try:
-        user = auth.create_user_with_email_and_password(email, password)
-        uid = user['localId']
-        db.collection('users').document(uid).set({
-            'email': email,
-            'name': name
-        })
-        return jsonify({"msg": "Тіркелу сәтті өтті"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    email = data.get("email")
-    password = data.get("password")
-
-    try:
-        user = auth.sign_in_with_email_and_password(email, password)
-        token = user['idToken']
-        uid = user['localId']
-
-        # Firestore ішіндегі қолданушы құжатын жаңарту
-        db.collection('users').document(uid).update({
-            'last_login': datetime.utcnow()
-        })
-
-        return jsonify({
-            "msg": "Кіру сәтті өтті",
-            "idToken": token,
-            "uid": uid
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 401
+# Create a Blueprint for post-related routes
+posts_bp = Blueprint('posts', __name__)
 
 
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = None
-
-        # Токенді "Authorization" хэдерінен іздейміз
-        if 'Authorization' in request.headers:
-            parts = request.headers['Authorization'].split(" ")
-            if len(parts) == 2 and parts[0] == "Bearer":
-                token = parts[1]
-
-        if not token:
-            return jsonify({'message': 'Токен берілмеген'}), 401
-
-        try:
-            # Firebase Admin арқылы токенді тексеру
-            decoded_token = admin_auth.verify_id_token(token)
-            request.uid = decoded_token['uid']  # UID сақтаймыз
-        except Exception as e:
-            return jsonify({'message': 'Токен жарамсыз', 'error': str(e)}), 401
-
-        return f(*args, **kwargs)
-    return decorated
- 
-@app.route('/protected', methods=['GET'])
-@token_required
-def protected():
-    return jsonify({
-        'message': 'Бұл қорғалған маршрут',
-        'uid': request.uid
-    }), 200
-
-@app.route('/upload_post', methods=['POST'])
+@posts_bp.route('/upload_post', methods=['POST'])
 @token_required
 def upload_post():
+    """
+    Handles uploading a new post with an image and caption.
+    Requires authentication.
+    """
     if 'image' not in request.files:
         return jsonify({'error': 'Сурет жүктелмеген'}), 400
 
     image = request.files['image']
     caption = request.form.get('caption', '')
+
     if image.filename == '':
         return jsonify({'error': 'Файл атауы бос'}), 400
 
+    temp_path = None  # Initialize temp_path outside try block for cleanup
+
     try:
+        # Securely generate filename and create a unique name for storage
         filename = secure_filename(image.filename)
-        ext = filename.rsplit('.', 1)[-1]
+        ext = filename.rsplit('.', 1)[-1].lower()
         unique_name = str(uuid.uuid4()) + '.' + ext
-        temp_path = os.path.join('static', unique_name)
+
+        # Save the image to a temporary local directory
+        temp_path = os.path.join(UPLOAD_FOLDER, unique_name)
         image.save(temp_path)
 
-        # Firebase Storage-қа жүктеу
-        bucket = storage.bucket()
+        # Upload the image to Firebase Storage
         blob = bucket.blob(f'posts/{unique_name}')
         blob.upload_from_filename(temp_path)
-        blob.make_public()
+        blob.make_public()  # Make the image publicly accessible
         image_url = blob.public_url
 
-        # Жергілікті файлды өшіру
+        # Delete the temporary local file
         os.remove(temp_path)
 
-        # Firestore-ға пост дерегін жазу
+        # Store post data in Firestore
         post_data = {
-            'author': request.uid,
+            'author': request.uid,  # Author UID from the authenticated request
             'caption': caption,
             'image_url': image_url,
+            'likes': 0,  # Initialize likes to 0
+            'liked_by': [],  # List to store UIDs of users who liked the post
             'created_at': datetime.utcnow()
         }
         db.collection('posts').add(post_data)
@@ -152,26 +64,38 @@ def upload_post():
         return jsonify({'msg': 'Пост сәтті жүктелді', 'image_url': image_url}), 200
 
     except Exception as e:
+        # Ensure the temporary file is removed even if an error occurs during upload
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         return jsonify({'error': str(e)}), 500
-    
-@app.route('/feed', methods=['GET'])
+
+
+@posts_bp.route('/feed', methods=['GET'])
 def get_feed():
+    """
+    Retrieves a feed of posts, optionally sorted by likes or creation time.
+    """
     try:
-        sort_by = request.args.get('sort', 'new')
+        sort_by = request.args.get('sort', 'new')  # Default sort by 'new'
 
         posts_ref = db.collection('posts')
 
         if sort_by == 'likes':
-            posts_ref = posts_ref.order_by('likes', direction=firestore.Query.DESCENDING)
+            # Order by 'likes' in descending order
+            posts_ref = posts_ref.order_by(
+                'likes', direction=firestore.Query.DESCENDING)
         else:
-            posts_ref = posts_ref.order_by('created_at', direction=firestore.Query.DESCENDING)
+            # Default: order by 'created_at' in descending order
+            posts_ref = posts_ref.order_by(
+                'created_at', direction=firestore.Query.DESCENDING)
 
-        posts = posts_ref.stream()
+        posts = posts_ref.stream()  # Get all posts
 
         result = []
         for post in posts:
             post_data = post.to_dict()
             result.append({
+                'id': post.id,  # Include document ID for actions like like/comment
                 'author': post_data.get('author'),
                 'caption': post_data.get('caption'),
                 'image_url': post_data.get('image_url'),
@@ -184,12 +108,15 @@ def get_feed():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-    
-@app.route('/my_posts', methods=['GET'])
+
+@posts_bp.route('/my_posts', methods=['GET'])
 @token_required
 def get_my_posts():
+    """
+    Retrieves all posts created by the authenticated user.
+    """
     try:
-        user_id = request.uid  # Токеннен UID алынды
+        user_id = request.uid  # Get UID from the authenticated request
         posts_ref = db.collection('posts')\
             .where('author', '==', user_id)\
             .order_by('created_at', direction=firestore.Query.DESCENDING)
@@ -200,21 +127,25 @@ def get_my_posts():
         for post in posts:
             post_data = post.to_dict()
             result.append({
+                'id': post.id,  # Include document ID for actions like delete/edit
                 'caption': post_data.get('caption'),
                 'image_url': post_data.get('image_url'),
                 'created_at': post_data.get('created_at').isoformat() if 'created_at' in post_data else None,
                 'likes': post_data.get('likes', 0)
-
             })
 
         return jsonify(result), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
-@app.route('/like_post/<post_id>', methods=['POST'])
+
+
+@posts_bp.route('/like_post/<post_id>', methods=['POST'])
 @token_required
 def like_post(post_id):
+    """
+    Allows an authenticated user to like a post. Prevents multiple likes from the same user.
+    """
     try:
         uid = request.uid
         post_ref = db.collection('posts').document(post_id)
@@ -227,10 +158,11 @@ def like_post(post_id):
         liked_by = post_data.get('liked_by', [])
         likes = post_data.get('likes', 0)
 
+        # Check if the user has already liked this post
         if uid in liked_by:
             return jsonify({'msg': 'Сіз бұл постқа лайк басқансыз'}), 400
 
-        # Лайкты жаңарту
+        # Update likes and add user to liked_by list
         liked_by.append(uid)
         likes += 1
 
@@ -245,9 +177,12 @@ def like_post(post_id):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/comment/<post_id>', methods=['POST'])
+@posts_bp.route('/comment/<post_id>', methods=['POST'])
 @token_required
 def add_comment(post_id):
+    """
+    Allows an authenticated user to add a comment to a post.
+    """
     try:
         user_id = request.uid
         comment_text = request.json.get('text', '').strip()
@@ -265,6 +200,7 @@ def add_comment(post_id):
             'created_at': datetime.utcnow()
         }
 
+        # Add comment to a subcollection 'comments' under the post document
         post_ref.collection('comments').add(comment_data)
 
         return jsonify({'msg': 'Пікір сәтті қосылды'}), 200
@@ -273,20 +209,26 @@ def add_comment(post_id):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/comments/<post_id>', methods=['GET'])
+@posts_bp.route('/comments/<post_id>', methods=['GET'])
 def get_comments(post_id):
+    """
+    Retrieves all comments for a specific post.
+    """
     try:
         post_ref = db.collection('posts').document(post_id)
         if not post_ref.get().exists:
             return jsonify({'error': 'Пост табылмады'}), 404
 
-        comments_ref = post_ref.collection('comments').order_by('created_at', direction=firestore.Query.ASCENDING)
+        # Retrieve comments, ordered by creation time
+        comments_ref = post_ref.collection('comments').order_by(
+            'created_at', direction=firestore.Query.ASCENDING)
         comments = comments_ref.stream()
 
         result = []
         for comment in comments:
             data = comment.to_dict()
             result.append({
+                'id': comment.id,  # Include comment ID if needed for future operations
                 'author': data.get('author'),
                 'text': data.get('text'),
                 'created_at': data.get('created_at').isoformat() if data.get('created_at') else None
@@ -297,56 +239,14 @@ def get_comments(post_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/profile/<uid>', methods=['GET'])
-def get_profile(uid):
-    try:
-        user_ref = db.collection('users').document(uid)
-        user_doc = user_ref.get()
 
-        if not user_doc.exists:
-            return jsonify({'error': 'Қолданушы табылмады'}), 404
-
-        user_data = user_doc.to_dict()
-
-        return jsonify({
-            'email': user_data.get('email'),
-            'name': user_data.get('name'),
-            'photo_url': user_data.get('photo_url', None)
-        }), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/edit_profile', methods=['POST'])
-@token_required
-def edit_profile():
-    try:
-        uid = request.uid
-        data = request.json
-
-        name = data.get('name')
-        photo_url = data.get('photo_url')
-
-        update_data = {}
-        if name:
-            update_data['name'] = name
-        if photo_url:
-            update_data['photo_url'] = photo_url
-
-        if not update_data:
-            return jsonify({'error': 'Өзгерту үшін деректер берілмеген'}), 400
-
-        user_ref = db.collection('users').document(uid)
-        user_ref.update(update_data)
-
-        return jsonify({'msg': 'Профиль сәтті жаңартылды'}), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/delete_post/<post_id>', methods=['DELETE'])
+@posts_bp.route('/delete_post/<post_id>', methods=['DELETE'])
 @token_required
 def delete_post(post_id):
+    """
+    Allows an authenticated user to delete their own post.
+    Also deletes the associated image from Firebase Storage.
+    """
     try:
         uid = request.uid
         post_ref = db.collection('posts').document(post_id)
@@ -357,22 +257,26 @@ def delete_post(post_id):
 
         post_data = post_doc.to_dict()
 
-        # Тек автор ғана өшіре алады
+        # Only the author can delete their post
         if post_data.get('author') != uid:
             return jsonify({'error': 'Тек өз постыңызды ғана өшіре аласыз'}), 403
 
-        # Суретті Storage-тен өшіру
+        # Delete the image from Storage if it exists
         image_url = post_data.get('image_url')
         if image_url:
-            # URL ішінен файл атын бөліп алу
-            from urllib.parse import urlparse, unquote
+            # Extract the file name from the URL
             parsed_url = urlparse(image_url)
             path = unquote(parsed_url.path)
-            file_name = path.split('/')[-1]
-            blob = storage.bucket().blob(f'posts/{file_name}')
+            # The path typically looks like /o/posts%2Funique_name.jpg
+            # We need to get 'posts/unique_name.jpg'
+            file_name_with_path = path.split('/o/')[-1]
+            if '%2F' in file_name_with_path:  # Handle URL encoded slashes
+                file_name_with_path = file_name_with_path.replace('%2F', '/')
+
+            blob = bucket.blob(file_name_with_path)
             blob.delete()
 
-        # Firestore-дан постты өшіру
+        # Delete the post from Firestore
         post_ref.delete()
 
         return jsonify({'msg': 'Пост сәтті өшірілді'}), 200
@@ -380,9 +284,13 @@ def delete_post(post_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/edit_post/<post_id>', methods=['POST'])
+
+@posts_bp.route('/edit_post/<post_id>', methods=['POST'])
 @token_required
 def edit_post(post_id):
+    """
+    Allows an authenticated user to edit the caption of their own post.
+    """
     try:
         uid = request.uid
         data = request.json
@@ -398,25 +306,40 @@ def edit_post(post_id):
             return jsonify({'error': 'Пост табылмады'}), 404
 
         post_data = post_doc.to_dict()
+        # Only the author can edit their post
         if post_data.get('author') != uid:
             return jsonify({'error': 'Сіз тек өз постыңызды ғана өңдей аласыз'}), 403
 
+        # Update the caption in Firestore
         post_ref.update({'caption': new_caption})
 
         return jsonify({'msg': 'Сипаттама сәтті жаңартылды'}), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
-@app.route('/search', methods=['GET'])
+
+
+@posts_bp.route('/search', methods=['GET'])
 def search_posts():
+    """
+    Searches for posts by keyword in their captions.
+    Note: Firestore's `where` clause for `in` or `array-contains`
+    is better suited for exact matches or array elements.
+    For substring search, fetching and filtering client-side is often needed
+    unless full-text search solutions like Algolia or Elasticsearch are integrated.
+    This implementation fetches all and filters, which might be inefficient for large datasets.
+    """
     try:
         keyword = request.args.get('keyword', '').lower().strip()
 
         if not keyword:
             return jsonify({'error': 'Кілт сөз берілмеген'}), 400
 
-        posts_ref = db.collection('posts').order_by('created_at', direction=firestore.Query.DESCENDING)
+        # Fetch all posts (or a limited number if pagination is implemented)
+        # and filter by keyword in caption client-side.
+        # For large datasets, consider a dedicated search solution.
+        posts_ref = db.collection('posts').order_by(
+            'created_at', direction=firestore.Query.DESCENDING)
         posts = posts_ref.stream()
 
         result = []
@@ -424,8 +347,9 @@ def search_posts():
             post_data = post.to_dict()
             caption = post_data.get('caption', '').lower()
 
-            if keyword in caption:
+            if keyword in caption:  # Simple substring search
                 result.append({
+                    'id': post.id,  # Include document ID
                     'author': post_data.get('author'),
                     'caption': post_data.get('caption'),
                     'image_url': post_data.get('image_url'),
@@ -437,28 +361,3 @@ def search_posts():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.errorhandler(400)
-def bad_request(e):
-    return jsonify({'error': 'Қате сұраныс'}), 400
-
-@app.errorhandler(401)
-def unauthorized(e):
-    return jsonify({'error': 'Авторизация қажет'}), 401
-
-@app.errorhandler(403)
-def forbidden(e):
-    return jsonify({'error': 'Рұқсат жоқ'}), 403
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Бет табылмады'}), 404
-
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({'error': 'Сервер қатесі'}), 500
-
-
-
-if __name__ == '__main__':
-    app.run(debug=True)
